@@ -487,16 +487,212 @@ State management: React Context + `useReducer`. All API calls through a central 
 
 ---
 
-## 9. Build Order
+## 9. Build Order & Week Checkpoints
 
-| Week | What to Build | Why First |
-|---|---|---|
-| 1 | DB schema, Pydantic models, problem seed (30 problems), sandbox | Everything depends on these; sandbox is highest-risk |
-| 2 | Progress Tracker Agent, Problem Selector Agent, auth routes | Tracker defines what Selector reads; auth unblocks API testing |
-| 3 | Code Review Agent, Interview Simulation Agent, all FastAPI routes | Code Review unblocks Pattern Detection (depends on review data) |
-| 4 | Orchestrator, Pattern Detection Agent | Wire everything together; full session testable end-to-end |
-| 5 | React frontend (Auth → Session View → Dashboard → Progress) | Backend API must be stable first |
-| 6 | Prompt caching, rate limiting, expand dataset to 100+, scenario tests | Performance and polish after core is proven |
+---
+
+### Week 1 — Foundation ✅ DONE
+**Built:** DB schema (`db.py`), all Pydantic models (`schemas.py`), sandbox (`sandbox.py`), 30-problem seed script (`seed_problems.py`), `requirements.txt`, `.gitignore`, `.env.example`.
+
+**What to test manually:**
+
+```bash
+# 1. Install dependencies
+pip install -r requirements.txt
+
+# 2. Seed the database (creates backend/data/db.sqlite3 with 30 problems)
+python -m backend.scripts.seed_problems
+
+# 3. Verify the DB has problems
+python -c "
+import asyncio, aiosqlite
+async def check():
+    async with aiosqlite.connect('backend/data/db.sqlite3') as db:
+        cur = await db.execute('SELECT count(*) FROM problems')
+        print('Problems in DB:', (await cur.fetchone())[0])
+asyncio.run(check())
+"
+
+# 4. Smoke-test the sandbox with a correct solution
+python -c "
+from backend.models.schemas import ProblemTestCase
+from backend.services.sandbox import run_code
+code = '''
+def two_sum(nums, target):
+    seen = {}
+    for i, n in enumerate(nums):
+        if target - n in seen:
+            return [seen[target - n], i]
+        seen[n] = i
+'''
+result = run_code(code, 'two_sum', [
+    ProblemTestCase(input={'nums': [2,7,11,15], 'target': 9}, expected_output=[0,1])
+])
+print('All passed:', result.all_passed)
+print('Runtime ms:', result.runtime_ms)
+"
+
+# 5. Test sandbox timeout protection
+python -c "
+from backend.models.schemas import ProblemTestCase
+from backend.services.sandbox import run_code
+code = 'def two_sum(nums, target):\n    while True: pass'
+result = run_code(code, 'two_sum', [ProblemTestCase(input={'nums':[1],'target':1}, expected_output=[0,0])])
+print('Exit code (should be -1):', result.exit_code)
+print('Stderr:', result.stderr)
+"
+```
+
+---
+
+### Week 2 — Core Agents & Auth ✅ DONE
+**Built:** `backend/services/auth.py` (JWT), `backend/services/llm.py` (Anthropic client), `backend/api/auth.py` (register/login routes), `backend/api/deps.py` (JWT middleware), `backend/agents/problem_selector_agent.py`, `backend/agents/progress_tracker_agent.py`, `backend/prompts/problem_selector.py`, `backend/prompts/progress_tracker.py`, `backend/main.py`.
+
+**What to test manually:**
+
+```bash
+# 1. Copy env file and add your Anthropic key
+cp .env.example .env
+# Edit .env: set ANTHROPIC_API_KEY and JWT_SECRET
+
+# 2. Start the API server
+uvicorn backend.main:app --reload
+
+# 3. Register a user (in a new terminal)
+curl -s -X POST http://localhost:8000/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","email":"alice@example.com","password":"password123"}' | python -m json.tool
+
+# 4. Login and grab the token
+curl -s -X POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"password123"}' | python -m json.tool
+
+# 5. Try accessing a protected route without a token (should get 403)
+curl -s http://localhost:8000/api/v1/users/me/progress
+
+# 6. Use the Swagger UI to explore all routes
+# Open: http://localhost:8000/docs
+```
+
+---
+
+### Week 3 — Code Review Agent & Interview Simulation Agent
+**Build:** `backend/agents/code_review_agent.py`, `backend/agents/interview_simulation_agent.py`, `backend/prompts/code_review_complexity.py`, `backend/prompts/code_review_quality.py`, `backend/prompts/interview_simulation.py`, all session/progress FastAPI routes.
+
+**What to test manually (after build):**
+
+```bash
+# Start the server
+uvicorn backend.main:app --reload
+
+# Register + login, save token to TOKEN variable
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alice@example.com","password":"password123"}' | python -c "import sys,json; print(json.load(sys.stdin)['token'])")
+
+# Trigger a code review directly (submit a correct Two Sum solution)
+curl -s -X POST http://localhost:8000/api/v1/sessions \
+  -H "Authorization: Bearer $TOKEN" | python -m json.tool
+# Note the session_id from the response
+
+# Send an opening message to the interviewer
+curl -s -X POST http://localhost:8000/api/v1/sessions/1/message \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"content":"I understand the problem. My approach is to use a hash map."}' | python -m json.tool
+
+# Submit a solution
+curl -s -X POST http://localhost:8000/api/v1/sessions/1/submit-code \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "code": "def two_sum(nums, target):\n    seen = {}\n    for i, n in enumerate(nums):\n        if target - n in seen:\n            return [seen[target-n], i]\n        seen[n] = i",
+    "language": "python"
+  }' | python -m json.tool
+# Expect: all_passed=true, correctness_score=1.0, complexity_verdict="optimal"
+```
+
+---
+
+### Week 4 — Orchestrator & Pattern Detection Agent
+**Build:** `backend/services/orchestrator.py` (session state machine), `backend/agents/pattern_detection_agent.py`, `backend/prompts/pattern_detection.py`.
+
+**What to test manually (after build):**
+
+```bash
+# Run a complete session end-to-end from start to close
+# 1. Start session (problem is auto-selected)
+# 2. Have a multi-turn conversation through all phases
+# 3. Submit code
+# 4. End session and check learning path
+
+# Check pattern detections after a few sessions
+curl -s http://localhost:8000/api/v1/users/me/patterns \
+  -H "Authorization: Bearer $TOKEN" | python -m json.tool
+
+# Check full progress
+curl -s http://localhost:8000/api/v1/users/me/progress \
+  -H "Authorization: Bearer $TOKEN" | python -m json.tool
+
+# Check generated learning path
+curl -s http://localhost:8000/api/v1/users/me/learning-path \
+  -H "Authorization: Bearer $TOKEN" | python -m json.tool
+```
+
+---
+
+### Week 5 — React Frontend
+**Build:** Vite + React app in `frontend/`, Auth pages, Session View with Monaco Editor, Dashboard, Progress page.
+
+**What to test manually (after build):**
+
+```bash
+# Terminal 1: run the backend
+uvicorn backend.main:app --reload
+
+# Terminal 2: run the frontend
+cd frontend
+npm install
+npm run dev
+# Opens at http://localhost:5173
+
+# Golden path to test:
+# 1. Register a new account
+# 2. Click "Start Interview" from the Dashboard
+# 3. Chat through clarification → brute force → optimization phases
+# 4. Write a solution in the Monaco editor and submit
+# 5. Review the code feedback panel
+# 6. Check the Progress page for updated stats and learning path
+```
+
+---
+
+### Week 6 — Polish & Performance
+**Build:** Prompt caching (`cache_control` headers), rate limiting middleware, expand problem dataset to 100+.
+
+**What to test manually (after build):**
+
+```bash
+# Verify prompt caching is active — check Anthropic usage dashboard for cache hit rate
+# Hit the same session endpoint twice and compare response times
+
+# Test rate limiting: fire 6 code submissions in under a minute
+# Should receive HTTP 429 on the 6th
+
+# Confirm 100+ problems in the DB
+python -c "
+import asyncio, aiosqlite
+async def check():
+    async with aiosqlite.connect('backend/data/db.sqlite3') as db:
+        cur = await db.execute('SELECT topic, COUNT(*) FROM problems GROUP BY topic')
+        for row in await cur.fetchall():
+            print(row[0], row[1])
+asyncio.run(check())
+"
+```
+
+---
 
 ### Prompt File Map
 
