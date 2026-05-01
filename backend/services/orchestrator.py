@@ -1,9 +1,6 @@
 """
 Orchestrator — the only module that instantiates and calls agents.
 Agents never call each other directly.
-
-Week 3: session start, message handling, code submission, session close.
-Week 4: pattern detection agent wired in (stubs below marked TODO).
 """
 import asyncio
 import json
@@ -14,6 +11,7 @@ import aiosqlite
 from backend.agents import (
     code_review_agent,
     interview_simulation_agent,
+    pattern_detection_agent,
     problem_selector_agent,
     progress_tracker_agent,
 )
@@ -39,9 +37,6 @@ AGENT_TIMEOUT = 30  # seconds
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _empty_pattern_summary() -> PatternSummary:
-    # TODO (Week 4): replace with real Pattern Detection Agent output
-    return PatternSummary(weak_topics=[], dominant_patterns=[])
 
 
 async def _get_problem(db: aiosqlite.Connection, problem_id: int) -> ProblemRecord:
@@ -56,34 +51,13 @@ async def _get_problem(db: aiosqlite.Connection, problem_id: int) -> ProblemReco
 
 
 async def _get_pattern_summary(db: aiosqlite.Connection, user_id: int) -> PatternSummary:
-    # TODO (Week 4): call pattern_detection_agent.run() here
-    cur = await db.execute(
-        """
-        SELECT pattern_type, occurrence_count
-        FROM pattern_detections
-        WHERE user_id=?
-        ORDER BY occurrence_count DESC
-        LIMIT 5
-        """,
-        (user_id,),
-    )
-    rows = await cur.fetchall()
-    dominant = [r["pattern_type"] for r in rows]
-
-    cur = await db.execute(
-        """
-        SELECT topic, SUM(solved) * 1.0 / COUNT(*) as rate
-        FROM progress_records
-        WHERE user_id=?
-        GROUP BY topic
-        HAVING rate < 0.5 AND COUNT(*) >= 2
-        """,
-        (user_id,),
-    )
-    weak_rows = await cur.fetchall()
-    weak = [r["topic"] for r in weak_rows]
-
-    return PatternSummary(weak_topics=weak, dominant_patterns=dominant)
+    try:
+        return await asyncio.wait_for(
+            pattern_detection_agent.run(db, user_id, scope="recent", recent_limit=20),
+            timeout=AGENT_TIMEOUT,
+        )
+    except (asyncio.TimeoutError, Exception):
+        return PatternSummary(weak_topics=[], dominant_patterns=[])
 
 
 async def _topic_coverage(db: aiosqlite.Connection, user_id: int) -> dict[str, int]:
@@ -342,6 +316,16 @@ async def submit_code(session_id: int, user_id: int, code: str, language: str) -
             patterns_flagged=[],
         )
 
+    # Incremental pattern detection after submission
+    async with get_db() as db:
+        try:
+            await asyncio.wait_for(
+                pattern_detection_agent.run(db, user_id, scope="recent", recent_limit=10),
+                timeout=AGENT_TIMEOUT,
+            )
+        except Exception:
+            pass
+
     # Persist code review
     async with get_db() as db:
         await db.execute(
@@ -445,7 +429,8 @@ async def end_session(session_id: int, user_id: int) -> dict:
         last_sub = await cur.fetchone()
         last_sub = dict(last_sub) if last_sub else {}
 
-        started_at = datetime.fromisoformat(session["started_at"].replace("Z", "+00:00"))
+        raw_ts = session["started_at"].replace("Z", "")
+        started_at = datetime.fromisoformat(raw_ts).replace(tzinfo=timezone.utc)
         duration = int((datetime.now(timezone.utc) - started_at).total_seconds())
 
         solved = bool(last_sub.get("all_passed", False))
