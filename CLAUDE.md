@@ -22,7 +22,7 @@ An **orchestrator module** coordinates the flow between all agents.
 
 - **Language:** Python
 - **Backend:** FastAPI
-- **AI/LLM:** Anthropic Claude API (primary), LangChain for agent orchestration
+- **AI/LLM:** Groq API (`llama-3.3-70b-versatile`), via the `groq` Python SDK
 - **Storage:** SQLite or JSON-based persistence
 - **Execution Sandbox:** Python isolated runner
 - **Frontend:** React (preferred) or Streamlit

@@ -2,8 +2,8 @@
 Code Review Agent.
 
 Two LLM calls:
-  1. Complexity analysis (cheap, low-temp, deterministic output).
-  2. Quality + feedback (richer, uses complexity result as input).
+  1. Complexity analysis (cheap, low-temp).
+  2. Quality + feedback (uses complexity result as input).
 
 correctness_score and patterns_flagged are computed deterministically — never via LLM.
 """
@@ -25,21 +25,20 @@ from backend.prompts.code_review_quality import (
     SYSTEM as QUALITY_SYSTEM,
     build_quality_prompt,
 )
-from backend.services.llm import MODEL, get_client
+from backend.services.llm import chat
 
-# Which edge-case keywords map to which pattern types
 _EDGE_CASE_PATTERN_MAP: dict[str, PatternType] = {
-    "empty":          "missing-edge-case",
-    "null":           "missing-null-check",
-    "none":           "missing-null-check",
-    "single":         "missing-edge-case",
-    "boundary":       "off-by-one",
-    "off-by-one":     "off-by-one",
-    "index":          "off-by-one",
-    "overflow":       "missing-edge-case",
-    "negative":       "missing-edge-case",
-    "duplicate":      "missing-edge-case",
-    "zero":           "missing-edge-case",
+    "empty":      "missing-edge-case",
+    "null":       "missing-null-check",
+    "none":       "missing-null-check",
+    "single":     "missing-edge-case",
+    "boundary":   "off-by-one",
+    "off-by-one": "off-by-one",
+    "index":      "off-by-one",
+    "overflow":   "missing-edge-case",
+    "negative":   "missing-edge-case",
+    "duplicate":  "missing-edge-case",
+    "zero":       "missing-edge-case",
 }
 
 
@@ -59,23 +58,22 @@ def _call_complexity(
     optimal_time: str,
     optimal_space: str,
 ) -> tuple[str, str, ComplexityVerdict]:
-    client = get_client()
-    prompt = build_complexity_prompt(code, constraints, optimal_time, optimal_space)
-    msg = client.messages.create(
-        model=MODEL,
-        max_tokens=150,
-        temperature=0.1,
-        system=COMPLEXITY_SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-    )
     try:
-        data = json.loads(msg.content[0].text)
+        raw = chat(
+            system=COMPLEXITY_SYSTEM,
+            user=build_complexity_prompt(code, constraints, optimal_time, optimal_space),
+            max_tokens=150,
+            temperature=0.1,
+        )
+        # Strip potential markdown fences
+        raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        data = json.loads(raw)
         return (
             data.get("detected_time_complexity", "unknown"),
             data.get("detected_space_complexity", "unknown"),
             data.get("complexity_verdict", "unknown"),
         )
-    except (json.JSONDecodeError, KeyError):
+    except Exception:
         return "unknown", "unknown", "unknown"
 
 
@@ -87,25 +85,23 @@ def _call_quality(
     space_complexity: str,
     complexity_verdict: str,
 ) -> tuple[list[str], list[CodeQualityIssue], list[str], str]:
-    client = get_client()
-    prompt = build_quality_prompt(
-        problem_title=problem.title,
-        problem_description=problem.description,
-        code=code,
-        sandbox_result=sandbox_result.model_dump(),
-        time_complexity=time_complexity,
-        space_complexity=space_complexity,
-        complexity_verdict=complexity_verdict,
-    )
-    msg = client.messages.create(
-        model=MODEL,
-        max_tokens=600,
-        temperature=0.3,
-        system=QUALITY_SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-    )
     try:
-        data = json.loads(msg.content[0].text)
+        raw = chat(
+            system=QUALITY_SYSTEM,
+            user=build_quality_prompt(
+                problem_title=problem.title,
+                problem_description=problem.description,
+                code=code,
+                sandbox_result=sandbox_result.model_dump(),
+                time_complexity=time_complexity,
+                space_complexity=space_complexity,
+                complexity_verdict=complexity_verdict,
+            ),
+            max_tokens=600,
+            temperature=0.3,
+        )
+        raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        data = json.loads(raw)
         issues = [
             CodeQualityIssue(**i) if isinstance(i, dict) else CodeQualityIssue(type="logic", description=str(i))
             for i in data.get("code_quality_issues", [])
@@ -116,7 +112,7 @@ def _call_quality(
             data.get("improvement_suggestions", []),
             data.get("overall_feedback", ""),
         )
-    except (json.JSONDecodeError, KeyError):
+    except Exception:
         return [], [], [], "Review could not be generated."
 
 
@@ -131,7 +127,6 @@ def run(
         else 0.0
     )
 
-    # LLM call 1: complexity
     time_c, space_c, verdict = _call_complexity(
         code,
         problem.constraints,
@@ -139,12 +134,9 @@ def run(
         problem.optimal_space_complexity,
     )
 
-    # LLM call 2: quality + feedback
     edge_cases, quality_issues, suggestions, overall = _call_quality(
         problem, code, sandbox_result, time_c, space_c, verdict
     )
-
-    patterns_flagged = _flag_patterns(edge_cases)
 
     return CodeReviewOutput(
         correctness_score=round(correctness_score, 3),
@@ -155,5 +147,5 @@ def run(
         code_quality_issues=quality_issues,
         improvement_suggestions=suggestions,
         overall_feedback=overall,
-        patterns_flagged=patterns_flagged,
+        patterns_flagged=_flag_patterns(edge_cases),
     )
