@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../AuthContext';
+import { normalizeApiError } from '../utils/errors';
 
 export default function Register() {
   const { register } = useAuth();
@@ -19,7 +20,7 @@ export default function Register() {
       await register(form.email, form.password, form.username);
       navigate('/');
     } catch (err) {
-      setError(err.response?.data?.detail || 'Registration failed');
+      setError(normalizeApiError(err, 'Registration failed'));
     } finally {
       setLoading(false);
     }
@@ -41,7 +42,7 @@ export default function Register() {
           </div>
           <div className="form-group">
             <label>Password</label>
-            <input type="password" value={form.password} onChange={set('password')} required minLength={6} />
+            <input type="password" value={form.password} onChange={set('password')} required minLength={8} />
           </div>
           {error && <p className="error-msg">{error}</p>}
           <button type="submit" className="btn-primary" disabled={loading}>

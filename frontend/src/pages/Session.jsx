@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import Editor from '@monaco-editor/react';
 import { sessionApi } from '../api';
+import { normalizeApiError } from '../utils/errors';
 
 const PHASE_LABELS = {
   problem_presentation: 'Problem Presentation',
@@ -22,7 +23,7 @@ export default function Session() {
   const [phase, setPhase] = useState('clarification');
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
-  const [showEditor, setShowEditor] = useState(false);
+  const [showEditor, setShowEditor] = useState(true);
   const [code, setCode] = useState('# Write your solution here\n');
   const [submitting, setSubmitting] = useState(false);
   const [submitResult, setSubmitResult] = useState(null);
@@ -37,9 +38,7 @@ export default function Session() {
       const history = data.conversation_history || [];
       setMessages(history);
       const lastPhase = data.phase;
-      if (['coding', 'code_review', 'wrap_up'].includes(lastPhase)) {
-        setShowEditor(true);
-      }
+      setShowEditor(true);
     });
   }, [id]);
 
@@ -61,7 +60,7 @@ export default function Session() {
       if (data.should_show_code_editor) setShowEditor(true);
       if (data.session_complete) setSessionDone(true);
     } catch (err) {
-      setMessages((m) => [...m, { role: 'assistant', content: 'Error: ' + (err.response?.data?.detail || 'Failed to send message') }]);
+      setMessages((m) => [...m, { role: 'assistant', content: `Error: ${normalizeApiError(err, 'Failed to send message')}` }]);
     } finally {
       setSending(false);
     }
@@ -77,7 +76,7 @@ export default function Session() {
       setMessages((m) => [...m, { role: 'assistant', content: data.interviewer_follow_up }]);
       if (data.all_passed) setSessionDone(true);
     } catch (err) {
-      setSubmitResult({ error: err.response?.data?.detail || 'Submission failed' });
+      setSubmitResult({ error: normalizeApiError(err, 'Submission failed') });
     } finally {
       setSubmitting(false);
     }
@@ -93,11 +92,24 @@ export default function Session() {
     }
   }
 
+  async function handleExitSession() {
+    setEnding(true);
+    try {
+      // Persist progress even if the user exits before fully solving.
+      await sessionApi.end(id);
+    } catch {
+      // Ignore end-session failures on explicit exit and return user to dashboard.
+    } finally {
+      navigate('/');
+    }
+  }
+
   if (!session) {
     return <div className="loading-screen">Loading session...</div>;
   }
 
   const problem = session.problem;
+  const canEndSession = sessionDone || submitResult?.all_passed === true;
 
   return (
     <div className="session-layout">
@@ -110,12 +122,14 @@ export default function Session() {
           <span className="phase-label">{PHASE_LABELS[phase] || phase}</span>
         </div>
         <div className="session-actions">
-          {sessionDone && (
+          {canEndSession && (
             <button className="btn-primary" onClick={handleEndSession} disabled={ending}>
               {ending ? 'Ending...' : 'End & Save'}
             </button>
           )}
-          <button className="btn-ghost" onClick={() => navigate('/')}>Exit</button>
+          <button className="btn-ghost" onClick={handleExitSession} disabled={ending}>
+            {ending ? 'Exiting...' : 'Exit'}
+          </button>
         </div>
       </div>
 
@@ -124,6 +138,12 @@ export default function Session() {
         <div className="chat-panel">
           <div className="problem-desc">
             <h3>Problem</h3>
+            {problem?.function_name && (
+              <div className="expected-function-callout">
+                <span className="label">Expected function</span>
+                <code>{problem.function_name}(...)</code>
+              </div>
+            )}
             <p>{problem?.description}</p>
             {problem?.examples?.length > 0 && (
               <div className="examples">
@@ -154,7 +174,7 @@ export default function Session() {
             <div ref={chatEndRef} />
           </div>
 
-          {!sessionDone && (
+          {!canEndSession && (
             <form onSubmit={sendMessage} className="chat-input-row">
               <input
                 type="text"
@@ -172,10 +192,16 @@ export default function Session() {
         </div>
 
         {/* Right: Editor + Results */}
-        {showEditor && (
-          <div className="editor-panel">
-            <div className="editor-header">
-              <span>Python</span>
+        <div className={`editor-panel ${showEditor ? 'editor-panel-visible' : ''}`}>
+          <div className="editor-header">
+            <span>Python</span>
+            <div className="editor-header-actions">
+              {problem?.function_name && (
+                <span className="expected-function-inline">
+                  Expected: <code>{problem.function_name}(...)</code>
+                </span>
+              )}
+              <span className="phase-label">{phase === 'coding' ? 'Ready to code' : 'Editor available'}</span>
               <button
                 className="btn-primary"
                 onClick={handleSubmitCode}
@@ -184,74 +210,76 @@ export default function Session() {
                 {submitting ? 'Running...' : 'Submit Code'}
               </button>
             </div>
-            <div className="editor-wrapper">
-              <Editor
-                height="400px"
-                defaultLanguage="python"
-                theme="vs-dark"
-                value={code}
-                onChange={(v) => setCode(v || '')}
-                options={{
-                  fontSize: 14,
-                  minimap: { enabled: false },
-                  scrollBeyondLastLine: false,
-                  tabSize: 4,
-                }}
-              />
-            </div>
-
-            {submitResult && (
-              <div className="review-panel">
-                {submitResult.error ? (
-                  <p className="error-msg">{submitResult.error}</p>
-                ) : (
-                  <>
-                    <div className={`test-summary ${submitResult.all_passed ? 'passed' : 'failed'}`}>
-                      {submitResult.test_cases_passed}/{submitResult.test_cases_total} tests passed
-                      {submitResult.all_passed ? ' — All Passed!' : ''}
-                    </div>
-
-                    <div className="test-cases">
-                      {submitResult.test_case_results?.map((tc, i) => (
-                        <div key={i} className={`tc ${tc.passed ? 'tc-pass' : 'tc-fail'}`}>
-                          <span>{tc.passed ? '✓' : '✗'}</span>
-                          <span>Test {i + 1}</span>
-                          {!tc.passed && tc.error && <span className="tc-error">{tc.error}</span>}
-                        </div>
-                      ))}
-                    </div>
-
-                    {submitResult.review && (
-                      <div className="review-details">
-                        <h4>Code Review</h4>
-                        <div className="complexity-row">
-                          <span>Time: <b>{submitResult.review.detected_time_complexity}</b></span>
-                          <span>Space: <b>{submitResult.review.detected_space_complexity}</b></span>
-                          <span className={`badge verdict-${submitResult.review.complexity_verdict}`}>
-                            {submitResult.review.complexity_verdict}
-                          </span>
-                        </div>
-                        <p className="overall-feedback">{submitResult.review.overall_feedback}</p>
-                        {submitResult.review.edge_cases_missed?.length > 0 && (
-                          <div>
-                            <b>Edge cases missed:</b>
-                            <ul>{submitResult.review.edge_cases_missed.map((e, i) => <li key={i}>{e}</li>)}</ul>
-                          </div>
-                        )}
-                        {submitResult.review.improvement_suggestions?.length > 0 && (
-                          <div>
-                            <b>Suggestions:</b>
-                            <ul>{submitResult.review.improvement_suggestions.map((s, i) => <li key={i}>{s}</li>)}</ul>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </>
-                )}
-              </div>
-            )}
           </div>
-        )}
+          <div className="editor-wrapper">
+            <Editor
+              height="100%"
+              width="100%"
+              defaultLanguage="python"
+              theme="vs-dark"
+              value={code}
+              onChange={(v) => setCode(v || '')}
+              options={{
+                fontSize: 14,
+                minimap: { enabled: false },
+                scrollBeyondLastLine: false,
+                tabSize: 4,
+                automaticLayout: true,
+              }}
+            />
+          </div>
+
+          {submitResult && (
+            <div className="review-panel">
+              {submitResult.error ? (
+                <p className="error-msg">{submitResult.error}</p>
+              ) : (
+                <>
+                  <div className={`test-summary ${submitResult.all_passed ? 'passed' : 'failed'}`}>
+                    {submitResult.test_cases_passed}/{submitResult.test_cases_total} tests passed
+                    {submitResult.all_passed ? ' — All Passed!' : ''}
+                  </div>
+
+                  <div className="test-cases">
+                    {submitResult.test_case_results?.map((tc, i) => (
+                      <div key={i} className={`tc ${tc.passed ? 'tc-pass' : 'tc-fail'}`}>
+                        <span>{tc.passed ? '✓' : '✗'}</span>
+                        <span>Test {i + 1}</span>
+                        {!tc.passed && tc.error && <span className="tc-error">{tc.error}</span>}
+                      </div>
+                    ))}
+                  </div>
+
+                  {submitResult.review && (
+                    <div className="review-details">
+                      <h4>Code Review</h4>
+                      <div className="complexity-row">
+                        <span>Time: <b>{submitResult.review.detected_time_complexity}</b></span>
+                        <span>Space: <b>{submitResult.review.detected_space_complexity}</b></span>
+                        <span className={`badge verdict-${submitResult.review.complexity_verdict}`}>
+                          {submitResult.review.complexity_verdict}
+                        </span>
+                      </div>
+                      <p className="overall-feedback">{submitResult.review.overall_feedback}</p>
+                      {submitResult.review.edge_cases_missed?.length > 0 && (
+                        <div>
+                          <b>Edge cases missed:</b>
+                          <ul>{submitResult.review.edge_cases_missed.map((e, i) => <li key={i}>{e}</li>)}</ul>
+                        </div>
+                      )}
+                      {submitResult.review.improvement_suggestions?.length > 0 && (
+                        <div>
+                          <b>Suggestions:</b>
+                          <ul>{submitResult.review.improvement_suggestions.map((s, i) => <li key={i}>{s}</li>)}</ul>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

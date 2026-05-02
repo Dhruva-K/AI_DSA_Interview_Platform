@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../AuthContext';
 import { sessionApi, progressApi } from '../api';
+import { normalizeApiError } from '../utils/errors';
 
 export default function Dashboard() {
   const { user, logout } = useAuth();
@@ -23,7 +24,7 @@ export default function Dashboard() {
       const { data } = await sessionApi.start();
       navigate(`/session/${data.session_id}`);
     } catch (err) {
-      setError(err.response?.data?.detail || 'Failed to start session');
+      setError(normalizeApiError(err, 'Failed to start session'));
       setStarting(false);
     }
   }
