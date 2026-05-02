@@ -131,3 +131,42 @@ async def get_review(session_id: int, user: dict = Depends(get_current_user)):
             review[field] = json.loads(review[field])
 
     return review
+
+
+@router.get("/{session_id}/debug")
+async def session_debug(session_id: int, user: dict = Depends(get_current_user)):
+    """Diagnostic endpoint: returns session row, submissions, and progress records for debugging."""
+    user_id = user["user_id"]
+    async with get_db() as db:
+        cur = await db.execute("SELECT * FROM sessions WHERE id=?", (session_id,))
+        row = await cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Session not found")
+        session = dict(row)
+        if session["user_id"] != user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+        cur = await db.execute("SELECT COUNT(*) as cnt FROM submissions WHERE session_id=?", (session_id,))
+        subs_count = (await cur.fetchone())["cnt"]
+
+        cur = await db.execute(
+            "SELECT s.*, cr.correctness_score, cr.complexity_verdict FROM submissions s LEFT JOIN code_reviews cr ON cr.submission_id=s.id WHERE s.session_id=? ORDER BY s.attempt_number DESC LIMIT 1",
+            (session_id,),
+        )
+        last_sub = await cur.fetchone()
+        last_sub = dict(last_sub) if last_sub else None
+
+        cur = await db.execute("SELECT COUNT(*) as cnt FROM progress_records WHERE session_id=?", (session_id,))
+        progress_count = (await cur.fetchone())["cnt"]
+
+        cur = await db.execute("SELECT * FROM progress_records WHERE session_id=? ORDER BY created_at DESC LIMIT 1", (session_id,))
+        progress_row = await cur.fetchone()
+        progress_row = dict(progress_row) if progress_row else None
+
+    return {
+        "session": session,
+        "submissions_count": subs_count,
+        "last_submission": last_sub,
+        "progress_records_count": progress_count,
+        "last_progress_record": progress_row,
+    }

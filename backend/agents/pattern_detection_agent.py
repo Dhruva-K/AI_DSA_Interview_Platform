@@ -8,6 +8,7 @@ Two-pass design:
 Results are merged, deduplicated, and upserted into pattern_detections.
 """
 import json
+import logging
 import re
 
 import aiosqlite
@@ -15,6 +16,8 @@ import aiosqlite
 from backend.models.schemas import PatternSummary, Severity
 from backend.prompts.pattern_detection import SYSTEM, build_detection_prompt
 from backend.services.llm import chat
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Regex heuristics for fast pre-filtering
@@ -31,8 +34,8 @@ _HEURISTICS: list[tuple[str, str, str]] = [
      r"\[\s*len\s*\([^)]+\)\s*[-+]\s*\d+\s*\]"),
 
     ("missing-null-check",
-     "Attribute access on a variable that could be None without a prior None check",
-     r"(?<!\bif\b.{0,30})\b(\w+)\s*\.\s*\w+\s*(?!\s*is\s+None)"),
+     "Attribute access that could fail on None (e.g., node.left without checking)",
+     r"\b\w+\.\w+\b"),
 
     ("inefficient-loop",
      "Nested loop over the same collection suggesting O(n^2) where better is possible",
@@ -164,11 +167,13 @@ async def run(
 
     # Pass 1: regex
     regex_hits = _regex_pass(submissions)
+    logger.debug(f"Pattern detection: regex found {len(regex_hits)} hits for user {user_id}")
 
     # Pass 2: LLM (only if we have enough data to make it worthwhile)
     llm_patterns: list[dict] = []
     if len(submissions) >= 2:
         try:
+            logger.debug(f"Pattern detection: running LLM pass for {len(submissions)} submissions")
             raw = chat(
                 system=SYSTEM,
                 user=build_detection_prompt(submissions),
@@ -177,10 +182,12 @@ async def run(
             )
             raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
             llm_patterns = json.loads(raw).get("patterns", [])
-        except Exception:
-            pass
+            logger.debug(f"Pattern detection: LLM found {len(llm_patterns)} patterns for user {user_id}")
+        except Exception as e:
+            logger.error(f"Pattern detection LLM pass failed for user {user_id}: {e}", exc_info=True)
 
     all_patterns = _merge(regex_hits, llm_patterns)
+    logger.debug(f"Pattern detection: merged {len(all_patterns)} unique patterns for user {user_id}")
 
     # Upsert into pattern_detections
     for p in all_patterns:
@@ -201,6 +208,8 @@ async def run(
             (user_id, p["pattern_type"], p["topic"], p["occurrences"], severity, sids),
         )
     await db.commit()
+    logger.debug(f"Pattern detection: upserted {len(all_patterns)} patterns for user {user_id}")
+
 
     # Build PatternSummary for downstream agents
     cur = await db.execute(

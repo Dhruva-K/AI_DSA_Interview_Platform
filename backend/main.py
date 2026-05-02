@@ -5,6 +5,14 @@ load_dotenv()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import logging
+
+
+# Configure basic logging for diagnostics
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 from backend.api import auth, progress, sessions
 from backend.services.db import init_db

@@ -36,12 +36,78 @@ RUNNER_TEMPLATE = textwrap.dedent("""\
     import importlib.util
     import traceback
     import io
+    import inspect
+    import re
 
     def load_solution(path):
         spec = importlib.util.spec_from_file_location("solution", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
+
+    def _to_snake_case(name):
+        s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\\1_\\2", name)
+        return re.sub(r"([a-z0-9])([A-Z])", r"\\1_\\2", s1).lower()
+
+    def _to_camel_case(name):
+        parts = [p for p in name.split("_") if p]
+        if not parts:
+            return name
+        return parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:])
+
+    def _normalized_name(name):
+        return name.replace("_", "").lower()
+
+    def _resolve_function(mod, function_name, test_cases):
+        # 1) Exact match first.
+        fn = getattr(mod, function_name, None)
+        if callable(fn):
+            return fn, function_name
+
+        callable_items = [
+            (name, value)
+            for name, value in vars(mod).items()
+            if callable(value) and not name.startswith("_")
+        ]
+
+        # 2) Common naming transformations (snake_case <-> camelCase).
+        aliases = {
+            function_name,
+            _to_snake_case(function_name),
+            _to_camel_case(function_name),
+        }
+        for alias in aliases:
+            candidate = getattr(mod, alias, None)
+            if callable(candidate):
+                return candidate, alias
+
+        # 3) Relaxed comparison by normalized name.
+        target = _normalized_name(function_name)
+        normalized_matches = [
+            (name, value)
+            for name, value in callable_items
+            if _normalized_name(name) == target
+        ]
+        if len(normalized_matches) == 1:
+            return normalized_matches[0][1], normalized_matches[0][0]
+
+        # 4) Last resort: pick a function compatible with test input keys.
+        if test_cases:
+            sample_input = test_cases[0].get("input", {})
+            compatible = []
+            for name, value in callable_items:
+                try:
+                    inspect.signature(value).bind(**sample_input)
+                    compatible.append((name, value))
+                except Exception:
+                    continue
+            if len(compatible) == 1:
+                return compatible[0][1], compatible[0][0]
+
+        available = [name for name, _ in callable_items]
+        raise AttributeError(
+            f"Function '{function_name}' not found. Available callables: {available}"
+        )
 
     def run():
         data = json.loads(sys.stdin.read())
@@ -52,7 +118,7 @@ RUNNER_TEMPLATE = textwrap.dedent("""\
         results = []
         try:
             mod = load_solution(solution_path)
-            fn = getattr(mod, function_name)
+            fn, resolved_name = _resolve_function(mod, function_name, test_cases)
         except Exception:
             error_msg = traceback.format_exc()
             for i, tc in enumerate(test_cases):

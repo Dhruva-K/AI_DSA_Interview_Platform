@@ -7,6 +7,7 @@ import json
 from datetime import datetime, timezone
 
 import aiosqlite
+import logging
 
 from backend.models.schemas import (
     Difficulty,
@@ -21,6 +22,8 @@ from backend.services.llm import chat
 
 _DIFFICULTY_ORDER = ["easy", "medium", "hard"]
 _WEAK_THRESHOLD = 0.5
+
+logger = logging.getLogger(__name__)
 
 
 async def run(
@@ -54,12 +57,14 @@ async def run(
     )
     await db.commit()
     record_id = cur.lastrowid
+    logger.debug("Inserted progress_records id=%s for user=%s session=%s solved=%s", record_id, user_id, session_id, int(solved))
 
     await db.execute(
         "UPDATE sessions SET status='completed', ended_at=?, duration_seconds=? WHERE id=?",
         (datetime.now(timezone.utc).isoformat(), time_to_solve_seconds, session_id),
     )
     await db.commit()
+    logger.debug("Updated sessions id=%s status=completed duration=%s", session_id, time_to_solve_seconds)
 
     # --- Aggregate stats ---
     cur = await db.execute(

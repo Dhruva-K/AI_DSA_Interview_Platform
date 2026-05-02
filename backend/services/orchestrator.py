@@ -5,6 +5,7 @@ Agents never call each other directly.
 import asyncio
 import json
 from datetime import datetime, timezone
+import logging
 
 import aiosqlite
 
@@ -31,6 +32,8 @@ from backend.services.db import get_db
 from backend.services.sandbox import run_code
 
 AGENT_TIMEOUT = 30  # seconds
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +177,7 @@ async def start_session(user_id: int) -> dict:
         )
         await db.commit()
         session_id = cur.lastrowid
+        logger.debug("Created session %s for user %s problem %s", session_id, user_id, problem.id)
 
     # Generate opening message (outside DB context to avoid long LLM hold)
     opening = interview_simulation_agent.get_opening_message(problem, pattern_summary)
@@ -184,6 +188,7 @@ async def start_session(user_id: int) -> dict:
             "UPDATE sessions SET phase=? WHERE id=?", ("clarification", session_id)
         )
         await db.commit()
+        logger.debug("Session %s phase set to clarification", session_id)
 
     return {
         "session_id": session_id,
@@ -219,10 +224,12 @@ async def process_message(session_id: int, user_id: int, content: str) -> dict:
         )
 
     try:
+        logger.debug("Processing message for session %s: %s", session_id, content)
         sim_out = await asyncio.wait_for(
             asyncio.to_thread(interview_simulation_agent.run, sim_input),
             timeout=AGENT_TIMEOUT,
         )
+        logger.debug("Agent output for session %s: next_phase=%s should_request_code=%s session_complete=%s", session_id, sim_out.next_phase, getattr(sim_out, 'should_request_code', None), getattr(sim_out, 'session_complete', None))
     except asyncio.TimeoutError:
         from backend.agents.interview_simulation_agent import _fallback_response
         sim_out = type("FallbackOut", (), {
@@ -239,6 +246,7 @@ async def process_message(session_id: int, user_id: int, content: str) -> dict:
             "UPDATE sessions SET phase=? WHERE id=?", (sim_out.next_phase, session_id)
         )
         await db.commit()
+        logger.debug("Session %s updated phase -> %s", session_id, sim_out.next_phase)
 
     return {
         "role": "assistant",
@@ -294,6 +302,7 @@ async def submit_code(session_id: int, user_id: int, code: str, language: str) -
         )
         await db.commit()
         submission_id = cur.lastrowid
+        logger.debug("Persisted submission %s for session %s attempts=%s all_passed=%s", submission_id, session_id, attempt_number, sandbox_result.all_passed)
 
     # Code Review Agent (LLM calls, in thread pool)
     try:
@@ -319,12 +328,16 @@ async def submit_code(session_id: int, user_id: int, code: str, language: str) -
     # Incremental pattern detection after submission
     async with get_db() as db:
         try:
+            logger.debug(f"Starting pattern detection for user {user_id} after submission {submission_id}")
             await asyncio.wait_for(
                 pattern_detection_agent.run(db, user_id, scope="recent", recent_limit=10),
                 timeout=AGENT_TIMEOUT,
             )
-        except Exception:
-            pass
+            logger.debug(f"Pattern detection completed for user {user_id}")
+        except asyncio.TimeoutError:
+            logger.warning(f"Pattern detection timed out for user {user_id}")
+        except Exception as e:
+            logger.error(f"Pattern detection failed for user {user_id}: {e}", exc_info=True)
 
     # Persist code review
     async with get_db() as db:
@@ -388,6 +401,7 @@ async def submit_code(session_id: int, user_id: int, code: str, language: str) -
 
     async with get_db() as db:
         await _append_message(db, session_id, "assistant", follow_up_content)
+        logger.debug("Appended follow-up for session %s: %s", session_id, follow_up_content[:160])
 
     return {
         "submission_id": submission_id,
@@ -439,24 +453,26 @@ async def end_session(session_id: int, user_id: int) -> dict:
         complexity_verdict = last_sub.get("complexity_verdict", "") or ""
         patterns_triggered = json.loads(last_sub.get("edge_cases_missed", "[]") or "[]")
 
+        logger.debug("Invoking progress tracker for session %s user %s solved=%s attempts=%s", session_id, user_id, solved, attempts)
         tracker_out = await asyncio.wait_for(
-            progress_tracker_agent.run(
-                db=db,
-                user_id=user_id,
-                session_id=session_id,
-                problem_id=problem.id,
-                topic=problem.topic,
-                difficulty=problem.difficulty,
-                solved=solved,
-                attempts_count=attempts,
-                time_to_solve_seconds=duration,
-                final_correctness_score=correctness,
-                complexity_verdict=complexity_verdict,
-                patterns_triggered=patterns_triggered,
-                learning_path_snapshot={},
-            ),
-            timeout=AGENT_TIMEOUT,
-        )
+                progress_tracker_agent.run(
+                    db=db,
+                    user_id=user_id,
+                    session_id=session_id,
+                    problem_id=problem.id,
+                    topic=problem.topic,
+                    difficulty=problem.difficulty,
+                    solved=solved,
+                    attempts_count=attempts,
+                    time_to_solve_seconds=duration,
+                    final_correctness_score=correctness,
+                    complexity_verdict=complexity_verdict,
+                    patterns_triggered=patterns_triggered,
+                    learning_path_snapshot={},
+                ),
+                timeout=AGENT_TIMEOUT,
+            )
+        logger.debug("Progress tracker output for session %s: record_id=%s", session_id, tracker_out.progress_record_id)
 
     return {
         "session_summary": {
